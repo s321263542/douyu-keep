@@ -1,0 +1,20 @@
+{
+  "name": "douyu-gift-tool",
+  "version": "1.0.0",
+  "description": "斗鱼荧光棒领取和粉丝牌保活工具",
+  "type": "module",
+  "scripts": {
+    "collect": "node collect-gift.mjs",
+    "keepalive": "node keepalive.mjs",
+    "refresh": "node -e \"import('./refresh-cookie.mjs').then(m => m.refreshCookieWithLtp0())\"",
+    "qr-login": "node qr-login-cmd.mjs",
+    "web-qr": "node web-qr.mjs",
+    "all": "node run.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.16.0",
+    "nodemailer": "^6.9.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.20.0"
+  }
+}
