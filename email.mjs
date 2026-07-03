@@ -5,9 +5,11 @@
  */
 
 import nodemailer from 'nodemailer'
-import config from './config.mjs'
+import { loadConfig } from './utils.mjs'
 
 export async function sendEmail(subject, content) {
+  const config = await loadConfig()
+
   if (!config.email?.enabled) {
     console.log('邮件通知已禁用')
     return
@@ -26,7 +28,7 @@ export async function sendEmail(subject, content) {
   })
 
   const mailOptions = {
-    from: `"斗鱼荧光棒工具" <${smtp.user}>`,
+    from: `"脚本工具" <${smtp.user}>`,
     to: to,
     subject: subject,
     text: content,
@@ -45,7 +47,7 @@ export async function sendEmail(subject, content) {
 
 export function buildEmailContent(results) {
   const lines = [
-    '斗鱼荧光棒工具运行报告',
+    '脚本工具运行报告',
     '=' .repeat(40),
     '',
     `运行时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
@@ -91,7 +93,7 @@ export function buildEmailContent(results) {
 
   lines.push('')
   lines.push('-'.repeat(40))
-  lines.push('此邮件由斗鱼荧光棒工具自动发送')
+  lines.push('此邮件由脚本工具自动发送')
 
   return lines.join('\n')
 }

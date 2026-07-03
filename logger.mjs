@@ -4,7 +4,7 @@
  * 功能：记录运行日志，保存到文件
  */
 
-import { appendFileSync, mkdirSync, existsSync } from 'node:fs'
+import { appendFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 
 const LOGS_DIR = './logs'

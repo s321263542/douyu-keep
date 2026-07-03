@@ -10,50 +10,66 @@ import { sendEmail, buildEmailContent } from './email.mjs'
 import { run as collectGift } from './collect-gift.mjs'
 import { run as keepalive } from './keepalive.mjs'
 import { refreshCookieWithLtp0 } from './refresh-cookie.mjs'
-import config from './config.mjs'
+import { validateCookie } from './api.mjs'
+import { loadConfig, buildCookieString } from './utils.mjs'
 
 async function main() {
   logger.info('=== 斗鱼荧光棒工具 ===')
   logger.info(`运行时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`)
   logger.separator()
 
-  // 0. 尝试自动刷新 Cookie（如果配置了 LTP0）
+  // 0. Cookie 管理：先验证现有 Cookie，无效时才尝试刷新
   const refreshResult = { attempted: false, success: false, method: null }
+  const config = await loadConfig()
+  const cookie = buildCookieString(config.cookie)
   const ltp0 = config.ltp0?.trim()
 
-  if (ltp0) {
-    logger.info('[Cookie 管理] 检测到 LTP0 配置，尝试自动刷新 Cookie...')
-    logger.separator()
-    refreshResult.attempted = true
+  logger.info('[Cookie 管理] 验证当前 Cookie 是否可用...')
+  const cookieValid = await validateCookie(cookie)
 
-    const result = await refreshCookieWithLtp0()
-    if (result.success) {
-      refreshResult.success = true
-      refreshResult.method = 'ltp0'
-      logger.success(`[Cookie 管理] LTP0 刷新成功，已更新: ${result.refreshedKeys.join(', ')}`)
-    } else {
-      logger.warn(`[Cookie 管理] LTP0 刷新失败: ${result.error}`)
-      logger.info('[Cookie 管理] 尝试扫码登录...')
-
-      try {
-        const { startQrLogin } = await import('./qr-login.mjs')
-        const qrResult = await startQrLogin()
-        if (qrResult.success) {
-          refreshResult.success = true
-          refreshResult.method = 'qr'
-          logger.success('[Cookie 管理] 扫码登录成功！')
-        } else {
-          logger.error(`[Cookie 管理] 扫码登录失败: ${qrResult.error}`)
-          logger.warn('[Cookie 管理] 将使用现有 Cookie 继续执行（可能失败）')
-        }
-      } catch (error) {
-        logger.error(`[Cookie 管理] 扫码登录模块异常: ${error.message}`)
-        logger.warn('[Cookie 管理] 将使用现有 Cookie 继续执行（可能失败）')
-      }
-    }
+  if (cookieValid) {
+    logger.info('[Cookie 管理] 当前 Cookie 有效，跳过刷新')
   } else {
-    logger.info('[Cookie 管理] 未配置 LTP0，跳过自动刷新')
-    logger.info('[Cookie 管理] 提示：在 config.mjs 中填入 ltp0 可启用自动刷新，避免手动更新 Cookie')
+    logger.warn('[Cookie 管理] 当前 Cookie 已失效')
+
+    if (ltp0) {
+      logger.info('[Cookie 管理] 尝试用 LTP0 自动刷新...')
+      refreshResult.attempted = true
+
+      const result = await refreshCookieWithLtp0()
+      if (result.success) {
+        refreshResult.success = true
+        refreshResult.method = 'ltp0'
+        logger.success(`[Cookie 管理] LTP0 刷新成功，已更新: ${result.refreshedKeys.join(', ')}`)
+      } else {
+        logger.warn(`[Cookie 管理] LTP0 刷新失败: ${result.error}`)
+        logger.info('[Cookie 管理] 尝试扫码登录...')
+
+        try {
+          const { startQrLogin } = await import('./qr-login.mjs')
+          const qrResult = await startQrLogin()
+          if (qrResult.success) {
+            refreshResult.success = true
+            refreshResult.method = 'qr'
+            logger.success('[Cookie 管理] 扫码登录成功！')
+          } else {
+            logger.error(`[Cookie 管理] 扫码登录失败: ${qrResult.error}`)
+          }
+        } catch (error) {
+          logger.error(`[Cookie 管理] 扫码登录模块异常: ${error.message}`)
+        }
+      }
+    } else {
+      logger.warn('[Cookie 管理] 未配置 LTP0，无法自动刷新')
+      logger.info('[Cookie 管理] 提示：在 config.mjs 中填入 ltp0 可启用自动刷新')
+    }
+
+    // 所有刷新方式都失败，直接退出
+    if (!refreshResult.success) {
+      logger.error('[Cookie 管理] Cookie 已失效且无法自动刷新，退出任务')
+      logger.separator()
+      process.exit(1)
+    }
   }
 
   logger.separator()
@@ -70,10 +86,7 @@ async function main() {
   try {
     results.collect = await collectGift()
   } catch (error) {
-    results.collect = {
-      success: false,
-      error: error.message,
-    }
+    results.collect = { success: false, error: error.message }
     logger.error(`荧光棒领取任务异常: ${error.message}`)
   }
 
@@ -85,10 +98,7 @@ async function main() {
   try {
     results.keepalive = await keepalive()
   } catch (error) {
-    results.keepalive = {
-      success: false,
-      error: error.message,
-    }
+    results.keepalive = { success: false, error: error.message }
     logger.error(`粉丝牌保活任务异常: ${error.message}`)
   }
 

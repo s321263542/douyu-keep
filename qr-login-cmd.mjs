@@ -32,4 +32,7 @@ async function main() {
   }
 }
 
-main()
+main().catch(error => {
+  logger.error(`未预期的错误: ${error.message}`)
+  process.exit(1)
+})

@@ -7,181 +7,12 @@
 
 import axios from 'axios'
 import * as logger from './logger.mjs'
+import { loadConfig, buildCookieString, DOUYU_USER_AGENT } from './utils.mjs'
+import { getFansList, getGiftNumber, getDid, sendGift, parseDyAndSidFromCookie, sleep } from './api.mjs'
 
-// ==================== 配置 ====================
+// ==================== 常量 ====================
 
-// 将 cookie 对象转换为字符串
-function buildCookieString(cookieObj) {
-  return Object.entries(cookieObj)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('; ')
-}
-
-// 动态读取 config.mjs（绕过 ESM 模块缓存）
-async function loadConfig() {
-  const mod = await import(`./config.mjs?t=${Date.now()}`)
-  return mod.default
-}
-
-async function getCookie() {
-  const config = await loadConfig()
-  return buildCookieString(config.cookie)
-}
-
-async function getKeepaliveConfig() {
-  const config = await loadConfig()
-  return config.keepalive
-}
-// ==================== 配置结束 ====================
-
-const DOUYU_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/15.0.1901.188'
 const GLOW_STICK_GIFT_ID = 268
-
-// ==================== 工具函数 ====================
-
-function makeHeaders(cookie) {
-  return {
-    'Cookie': cookie,
-    'User-Agent': DOUYU_USER_AGENT,
-    'Referer': 'https://www.douyu.com/',
-    'Origin': '*',
-  }
-}
-
-function getCookieValue(cookie, name) {
-  const record = cookie.split(';').reduce((acc, chunk) => {
-    const [key, ...rest] = chunk.trim().split('=')
-    if (key?.trim()) acc[key.trim()] = rest.join('=').trim()
-    return acc
-  }, {})
-  return record[name]
-}
-
-function parseDyAndSidFromCookie(cookie) {
-  const sid = getCookieValue(cookie, 'acf_uid')
-  const dy = getCookieValue(cookie, 'dy_did')
-  if (!sid || !dy) {
-    throw new Error('Cookie 中没有找到 acf_uid(sid) 和 dy_did(dy)')
-  }
-  return { sid, dy }
-}
-
-function sleep(time) {
-  return new Promise(resolve => setTimeout(resolve, time))
-}
-
-// ==================== API 函数 ====================
-
-async function getFansList(cookie) {
-  const res = await axios.get('https://www.douyu.com/member/cp/getFansBadgeList', {
-    headers: makeHeaders(cookie),
-  })
-
-  logger.info(`  API 响应状态: ${res.status}`)
-  logger.info(`  响应类型: ${typeof res.data}`)
-
-  if (typeof res.data !== 'string') {
-    // 尝试解析 JSON 格式
-    if (typeof res.data === 'object' && res.data !== null) {
-      logger.info('  尝试解析 JSON 格式响应...')
-      if (Array.isArray(res.data)) {
-        return res.data.map(item => ({
-          name: item.name || item.anchor_name || '未知',
-          roomId: Number(item.roomId || item.room_id || item.fans_room),
-          level: Number(item.level || item.fans_level || 1),
-        }))
-      }
-      if (res.data.data && Array.isArray(res.data.data)) {
-        return res.data.data.map(item => ({
-          name: item.name || item.anchor_name || '未知',
-          roomId: Number(item.roomId || item.room_id || item.fans_room),
-          level: Number(item.level || item.fans_level || 1),
-        }))
-      }
-    }
-    throw new Error(`获取粉丝牌列表失败，返回数据格式异常: ${JSON.stringify(res.data).substring(0, 200)}`)
-  }
-
-  const table = res.data.match(/fans-badge-list">([\S\s]*?)<\/table>/)?.[1]
-  if (!table) {
-    // 打印响应内容帮助调试
-    logger.info(`  响应内容前500字符: ${res.data.substring(0, 500)}`)
-    throw new Error('获取粉丝牌列表失败，请检查 Cookie 是否有效')
-  }
-
-  const list = table.match(/<tr([\s\S]*?)<\/tr>/g)
-  list?.shift()
-  const fans = list?.map((item) => {
-    const name = item.match(/data-anchor_name="([\S\s]+?)"/)?.[1]
-    const roomId = item.match(/data-fans-room="(\d+)"/)?.[1]
-    const level = item.match(/data-fans-level="(\d+)"/)?.[1]
-    return { name, roomId: Number(roomId), level: Number(level) }
-  }) ?? []
-
-  return fans
-}
-
-async function getGiftNumber(cookie, candidateRoomIds = []) {
-  const roomIds = [...new Set([217331, 557171, ...candidateRoomIds])]
-  const endpoints = roomIds.flatMap(rid => [
-    `https://www.douyu.com/japi/prop/backpack/web/v5?rid=${rid}`,
-    `https://www.douyu.com/japi/prop/backpack/web/v1?rid=${rid}`,
-  ])
-
-  for (const endpoint of endpoints) {
-    try {
-      const { data } = await axios.get(endpoint, {
-        headers: makeHeaders(cookie),
-      })
-
-      if (data?.error !== 0) continue
-      if (!data?.data?.list) continue
-
-      const glowSticks = data.data.list.filter(item => item.id === GLOW_STICK_GIFT_ID)
-      const count = glowSticks.reduce((sum, item) => sum + (item.count || 0), 0)
-      return count
-    } catch {
-      continue
-    }
-  }
-
-  throw new Error('获取荧光棒数量失败')
-}
-
-async function getDid(roomId, cookie) {
-  const res = await axios.get(`https://www.douyu.com/${roomId}`, {
-    headers: makeHeaders(cookie),
-  })
-  const did1 = res.data.match(/owner_uid =(.*?);/)?.[1]?.trim()
-  const did2 = res.data.match(/owner_uid:(.*?),/)?.[1]?.trim()
-  if (did1 !== undefined) return did1
-  if (did2 !== undefined) return did2
-  throw new Error('获取 did 失败')
-}
-
-async function sendGift(args, job, cookie) {
-  const formData = new URLSearchParams()
-  formData.append('rid', String(job.roomId))
-  formData.append('prop_id', String(job.giftId))
-  formData.append('num', String(job.count))
-  formData.append('sid', args.sid)
-  formData.append('did', args.did)
-  formData.append('dy', args.dy)
-
-  const res = await axios.post('https://www.douyu.com/member/prop/send', formData.toString(), {
-    headers: {
-      ...makeHeaders(cookie),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-  })
-
-  const data = res.data
-  if (data?.error !== undefined && data.error !== 0) {
-    throw new Error(`赠送失败，错误码 ${data.error}: ${data.msg || data.message || '无错误信息'}`)
-  }
-
-  return data
-}
 
 // ==================== 计算函数 ====================
 
@@ -266,9 +97,10 @@ export async function run() {
     error: null,
   }
 
-  // 动态读取 config，确保扫码登录更新后能读到最新值
-  const COOKIE = await getCookie()
-  const KEEPALIVE_CONFIG = await getKeepaliveConfig()
+  // 动态读取 config
+  const config = await loadConfig()
+  const COOKIE = buildCookieString(config.cookie)
+  const KEEPALIVE_CONFIG = config.keepalive
 
   if (!COOKIE) {
     result.error = '请先在 config.mjs 中填入你的斗鱼 Cookie'
@@ -276,7 +108,7 @@ export async function run() {
     return result
   }
 
-  logger.info('=== 斗鱼粉丝牌保活 ===')
+  logger.info('=== 粉丝牌保活 ===')
   logger.separator()
 
   // 1. 获取粉丝牌列表
@@ -373,7 +205,8 @@ export async function run() {
   for (const item of Object.values(jobs)) {
     if (item.count === 0) continue
 
-    item.count = (item.count ?? 0) + failedNumber
+    const originalCount = item.count
+    item.count = originalCount + failedNumber
 
     try {
       logger.info(`  正在赠送房间 ${item.roomId} ${item.count} 个荧光棒...`)
@@ -384,7 +217,7 @@ export async function run() {
       successCount += item.count
       logger.success(`    赠送成功`)
     } catch (error) {
-      failedNumber += item?.count ?? 0
+      failedNumber += originalCount
       logger.error(`    赠送失败: ${error.message}`)
       logger.info(`    ${item.count} 个荧光棒自动移交给下一个房间`)
     }
@@ -418,9 +251,7 @@ export async function run() {
 // 如果直接运行此文件
 if (process.argv[1]?.endsWith('keepalive.mjs')) {
   run().then(result => {
-    if (!result.success) {
-      process.exit(1)
-    }
+    if (!result.success) process.exit(1)
   }).catch(error => {
     logger.error(`未预期的错误: ${error.message}`)
     process.exit(1)

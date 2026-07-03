@@ -8,52 +8,18 @@
 import { Buffer } from 'node:buffer'
 import crypto from 'node:crypto'
 import WebSocket from 'ws'
-import axios from 'axios'
 import * as logger from './logger.mjs'
+import { loadConfig, buildCookieString, getCookieValue, generateDeviceId, DOUYU_USER_AGENT } from './utils.mjs'
+import { getFansList, getGiftNumber } from './api.mjs'
 
-// ==================== 配置 ====================
+// ==================== 常量 ====================
 
-// 将 cookie 对象转换为字符串
-function buildCookieString(cookieObj) {
-  return Object.entries(cookieObj)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('; ')
-}
-
-// 动态读取 config.mjs（绕过 ESM 模块缓存，确保读到扫码登录后更新的最新值）
-async function loadConfig() {
-  const mod = await import(`./config.mjs?t=${Date.now()}`)
-  return mod.default
-}
-
-async function getCookie() {
-  const config = await loadConfig()
-  return buildCookieString(config.cookie)
-}
-
-async function getRoomId() {
-  const config = await loadConfig()
-  return config.roomId
-}
-// ==================== 配置结束 ====================
-
-const DOUYU_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/15.0.1901.188'
 const DOUYU_DANMU_WS_URL = 'wss://wsproxy.douyu.com:6672'
 const DOUYU_LOGIN_VK_SECRET = 'r5*^5;}2#${XF[h+;\'./.Q\'1;,-]f\'p['
 const COLLECT_TIMEOUT_MS = 15000
 const LOGIN_COOKIE_KEYS = ['acf_username', 'acf_ltkid', 'acf_biz', 'acf_stk', 'acf_ct']
-const GLOW_STICK_GIFT_ID = 268
 
-// ==================== 工具函数 ====================
-
-function getCookieValue(cookie, name) {
-  const record = cookie.split(';').reduce((acc, chunk) => {
-    const [key, ...rest] = chunk.trim().split('=')
-    if (key?.trim()) acc[key.trim()] = rest.join('=').trim()
-    return acc
-  }, {})
-  return record[name]
-}
+// ==================== 弹幕协议工具 ====================
 
 function escapeDouyuValue(value) {
   return value.replace(/@/g, '@A').replace(/\//g, '@S')
@@ -87,18 +53,8 @@ function decodeDouyuMessages(data) {
   return Array.from(buffer.toString('utf8').matchAll(/type@=.*?\0/g), match => match[0].slice(0, -1))
 }
 
-function randomDeviceId() {
-  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
-  const bytes = crypto.randomBytes(31)
-  let suffix = ''
-  for (const byte of bytes) {
-    suffix += alphabet[byte % alphabet.length]
-  }
-  return `b${suffix}`
-}
-
 function buildLoginPacket(roomId, cookie) {
-  const deviceId = randomDeviceId()
+  const deviceId = generateDeviceId()
   const timestamp = String(Math.floor(Date.now() / 1000))
   const vk = crypto
     .createHash('md5')
@@ -152,69 +108,6 @@ function buildEnterRoomPacket(roomId) {
 }
 
 // ==================== 核心逻辑 ====================
-
-async function getFansList(cookie) {
-  const res = await axios.get('https://www.douyu.com/member/cp/getFansBadgeList', {
-    headers: {
-      'Cookie': cookie,
-      'User-Agent': DOUYU_USER_AGENT,
-      'Referer': 'https://www.douyu.com/',
-      'Origin': '*',
-    },
-  })
-
-  if (typeof res.data !== 'string') {
-    throw new Error('获取粉丝牌列表失败，返回数据格式异常')
-  }
-
-  const table = res.data.match(/fans-badge-list">([\S\s]*?)<\/table>/)?.[1]
-  if (!table) {
-    throw new Error('获取粉丝牌列表失败，请检查 Cookie 是否有效')
-  }
-
-  const list = table.match(/<tr([\s\S]*?)<\/tr>/g)
-  list?.shift()
-  const fans = list?.map((item) => {
-    const name = item.match(/data-anchor_name="([\S\s]+?)"/)?.[1]
-    const roomId = item.match(/data-fans-room="(\d+)"/)?.[1]
-    const level = item.match(/data-fans-level="(\d+)"/)?.[1]
-    return { name, roomId: Number(roomId), level: Number(level) }
-  }) ?? []
-
-  return fans
-}
-
-async function getGiftNumber(cookie, candidateRoomIds = []) {
-  const roomIds = [...new Set([217331, 557171, ...candidateRoomIds])]
-  const endpoints = roomIds.flatMap(rid => [
-    `https://www.douyu.com/japi/prop/backpack/web/v5?rid=${rid}`,
-    `https://www.douyu.com/japi/prop/backpack/web/v1?rid=${rid}`,
-  ])
-
-  for (const endpoint of endpoints) {
-    try {
-      const { data } = await axios.get(endpoint, {
-        headers: {
-          'Cookie': cookie,
-          'User-Agent': DOUYU_USER_AGENT,
-          'Referer': 'https://www.douyu.com/',
-          'Origin': '*',
-        },
-      })
-
-      if (data?.error !== 0) continue
-      if (!data?.data?.list) continue
-
-      const glowSticks = data.data.list.filter(item => item.id === GLOW_STICK_GIFT_ID)
-      const count = glowSticks.reduce((sum, item) => sum + (item.count || 0), 0)
-      return count
-    } catch {
-      continue
-    }
-  }
-
-  throw new Error('获取荧光棒数量失败')
-}
 
 async function collectGiftViaDanmu(cookie, roomId) {
   const normalizedRoomId = String(roomId).trim()
@@ -300,9 +193,10 @@ export async function run() {
     error: null,
   }
 
-  // 动态读取 config，确保拿到扫码登录后更新的最新值
-  const COOKIE = await getCookie()
-  const ROOM_ID = await getRoomId()
+  // 动态读取 config
+  const config = await loadConfig()
+  const COOKIE = buildCookieString(config.cookie)
+  const ROOM_ID = config.roomId
 
   if (!COOKIE) {
     result.error = '请先在 config.mjs 中填入你的斗鱼 Cookie'
@@ -310,7 +204,7 @@ export async function run() {
     return result
   }
 
-  logger.info('=== 斗鱼荧光棒领取 ===')
+  logger.info('=== 荧光棒领取 ===')
   logger.separator()
 
   // 1. 获取粉丝牌列表
@@ -394,9 +288,7 @@ export async function run() {
 // 如果直接运行此文件
 if (process.argv[1]?.endsWith('collect-gift.mjs')) {
   run().then(result => {
-    if (!result.success) {
-      process.exit(1)
-    }
+    if (!result.success) process.exit(1)
   }).catch(error => {
     logger.error(`未预期的错误: ${error.message}`)
     process.exit(1)

@@ -3,27 +3,32 @@
  *
  * 使用：node web-qr.mjs
  * 然后手机浏览器访问：http://服务器IP:3456
- *
- * 功能：
- *   - 手机打开网页 → 点击按钮 → 页面直接显示二维码
- *   - 用斗鱼 App 扫码 → 页面自动显示登录结果
- *   - 登录成功后自动更新 config.mjs
- *   - 不依赖邮件，没有 5 分钟限制
  */
 
 import http from 'node:http'
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import crypto from 'node:crypto'
 import axios from 'axios'
 import QRCode from 'qrcode'
 import * as logger from './logger.mjs'
-import config from './config.mjs'
+import { validateCookie } from './api.mjs'
+import {
+  loadConfig,
+  buildCookieString,
+  getCookieValue,
+  parseCookieRecord,
+  readSetCookieHeaders,
+  mergeCookieWithSetCookieHeaders,
+  generateDeviceId,
+  createDeviceCookie,
+  updateConfigFields,
+  DOUYU_USER_AGENT,
+} from './utils.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-
 const PORT = 3456
-const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/15.0.1901.188'
 
 const PASSPORT_QR_GENERATE_URL = 'https://passport.douyu.com/scan/generateCode'
 const PASSPORT_QR_AUTH_URL = 'https://passport.douyu.com/japi/scan/auth'
@@ -34,84 +39,6 @@ const SAFE_AUTH_RETURNED_COOKIE_KEYS = ['acf_uid', 'acf_auth', 'acf_stk', 'acf_l
 const MAIN_COOKIE_REQUIRED_KEYS = ['acf_uid', 'acf_auth', 'acf_stk', 'acf_ltkid', 'acf_username', 'acf_biz', 'acf_ct']
 const YUBA_RETURNED_COOKIE_KEYS = ['acf_yb_auth', 'acf_yb_uid', 'acf_yb_t', 'acf_yb_new_uid', 'acf_jwt_token', 'acf_dmjwt_token', 'dy_did']
 
-import crypto from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
-
-// ==================== 工具函数 ====================
-
-function parseCookieRecord(cookie) {
-  return cookie.split(';').reduce((acc, chunk) => {
-    const [key, ...rest] = chunk.trim().split('=')
-    if (key?.trim()) acc[key.trim()] = rest.join('=').trim()
-    return acc
-  }, {})
-}
-
-function getCookieValue(cookie, name) {
-  return parseCookieRecord(cookie)[name]
-}
-
-function buildCookieHeader(cookieRecord) {
-  return Object.entries(cookieRecord)
-    .filter(([, value]) => value !== '')
-    .map(([name, value]) => `${name}=${value}`)
-    .join('; ')
-}
-
-function readSetCookieHeaders(headers) {
-  if (!headers) return []
-  const value = headers['set-cookie'] ?? headers['Set-Cookie']
-  if (Array.isArray(value)) return value.filter(item => typeof item === 'string')
-  return typeof value === 'string' ? [value] : []
-}
-
-function parseSetCookiePair(header) {
-  const firstPart = header.split(';')[0]?.trim() || ''
-  const separatorIndex = firstPart.indexOf('=')
-  if (separatorIndex <= 0) return null
-  const name = firstPart.slice(0, separatorIndex).trim()
-  const value = firstPart.slice(separatorIndex + 1)
-  return name ? [name, value] : null
-}
-
-function mergeCookieWithSetCookieHeaders(currentCookie, setCookieHeaders, allowedKeys) {
-  const nextCookies = parseCookieRecord(currentCookie)
-  const returnedKeys = []
-  for (const header of setCookieHeaders) {
-    const pair = parseSetCookiePair(header)
-    if (!pair) continue
-    const [name, value] = pair
-    if (allowedKeys.includes(name)) {
-      nextCookies[name] = value
-      if (!returnedKeys.includes(name)) returnedKeys.push(name)
-    }
-  }
-  return { refreshedCookie: buildCookieHeader(nextCookies), returnedKeys }
-}
-
-function generateDeviceId() {
-  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
-  const bytes = crypto.randomBytes(31)
-  let suffix = ''
-  for (const byte of bytes) suffix += alphabet[byte % alphabet.length]
-  return `b${suffix}`
-}
-
-function createDeviceCookie(deviceId) {
-  return `dy_did=${deviceId}; acf_did=${deviceId}; game_did=${deviceId}`
-}
-
-function updateConfigFields(updates) {
-  const configPath = './config.mjs'
-  let content = readFileSync(configPath, 'utf-8')
-  for (const [key, value] of Object.entries(updates)) {
-    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const regex = new RegExp(`(${escapedKey}\\s*:\\s*['"])([^'"]*)(['"])`)
-    if (regex.test(content)) content = content.replace(regex, `$1${value}$3`)
-  }
-  writeFileSync(configPath, content, 'utf-8')
-}
-
 // ==================== 任务执行状态 ====================
 
 let taskStatus = { running: false, startTime: null, endTime: null, output: '', error: null }
@@ -121,12 +48,27 @@ function runTasks() {
   taskStatus = { running: true, startTime: Date.now(), endTime: null, output: '', error: null }
 
   const runMjsPath = join(__dirname, 'run.mjs')
-  execFile(process.execPath, [runMjsPath], { cwd: __dirname, timeout: 120000 }, (error, stdout, stderr) => {
+  const child = spawn(process.execPath, [runMjsPath], { cwd: __dirname })
+
+  child.stdout.on('data', (data) => {
+    taskStatus.output += data.toString()
+  })
+  child.stderr.on('data', (data) => {
+    taskStatus.output += data.toString()
+  })
+  child.on('close', (code) => {
     taskStatus.running = false
     taskStatus.endTime = Date.now()
-    taskStatus.output = stdout || ''
-    taskStatus.error = error ? (stderr || error.message) : null
-    logger.info(`[Web 任务] 执行完成${error ? '（有错误）' : '（成功）'}`)
+    if (code !== 0) {
+      taskStatus.error = `进程退出码: ${code}`
+    }
+    logger.info(`[Web 任务] 执行完成（退出码: ${code}）`)
+  })
+  child.on('error', (error) => {
+    taskStatus.running = false
+    taskStatus.endTime = Date.now()
+    taskStatus.error = error.message
+    logger.error(`[Web 任务] 执行失败: ${error.message}`)
   })
   return true
 }
@@ -146,7 +88,7 @@ async function generateQrChallenge() {
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'X-Requested-With': 'XMLHttpRequest',
-      'User-Agent': USER_AGENT,
+      'User-Agent': DOUYU_USER_AGENT,
       'Referer': PASSPORT_LOGIN_REFERER,
       'Cookie': deviceCookie,
     },
@@ -170,7 +112,7 @@ async function pollQrAuth(code, deviceCookie) {
     headers: {
       'Cookie': deviceCookie,
       'X-Requested-With': 'XMLHttpRequest',
-      'User-Agent': USER_AGENT,
+      'User-Agent': DOUYU_USER_AGENT,
       'Referer': PASSPORT_LOGIN_REFERER,
     },
     params: { time: String(Date.now()), code },
@@ -198,7 +140,7 @@ async function fetchMainCookies(loginUrl, passportCookie) {
   if (!url.searchParams.has('_')) url.searchParams.set('_', String(Date.now()))
 
   const response = await axios.get(url.toString(), {
-    headers: { 'Cookie': passportCookie, 'User-Agent': USER_AGENT, 'Referer': 'https://www.douyu.com/' },
+    headers: { 'Cookie': passportCookie, 'User-Agent': DOUYU_USER_AGENT, 'Referer': 'https://www.douyu.com/' },
     validateStatus: status => status >= 200 && status < 400,
   })
 
@@ -212,7 +154,7 @@ async function fetchYubaCookies(passportCookie, mainCookie) {
   const mergedCookie = [passportCookie, mainCookie].filter(Boolean).join('; ')
 
   const seedResponse = await axios.get('https://yuba.douyu.com/mygroups', {
-    headers: { 'Cookie': mergedCookie, 'User-Agent': USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups' },
+    headers: { 'Cookie': mergedCookie, 'User-Agent': DOUYU_USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups' },
     validateStatus: status => status >= 200 && status < 400,
   })
 
@@ -225,7 +167,7 @@ async function fetchYubaCookies(passportCookie, mainCookie) {
   const safeAuthResponse = await axios.get('https://passport.douyu.com/lapi/passport/iframe/safeAuth', {
     headers: {
       'Cookie': [mergedCookie, yubaCookie].filter(Boolean).join('; '),
-      'User-Agent': USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups', 'Origin': 'https://yuba.douyu.com',
+      'User-Agent': DOUYU_USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups', 'Origin': 'https://yuba.douyu.com',
     },
     params: { client_id: '5', ...(dyDid ? { did: dyDid } : {}), t: String(Date.now()), callback: 'axiosJsonpCallback' },
     maxRedirects: 0, validateStatus: status => status >= 200 && status < 400,
@@ -237,13 +179,30 @@ async function fetchYubaCookies(passportCookie, mainCookie) {
   const location = rawLocation.startsWith('http') ? rawLocation : `https://yuba.douyu.com${rawLocation.startsWith('/') ? '' : '/'}${rawLocation}`
 
   const authResponse = await axios.get(location, {
-    headers: { 'Cookie': [passportCookie, mainCookie, yubaCookie].filter(Boolean).join('; '), 'User-Agent': USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups' },
+    headers: { 'Cookie': [passportCookie, mainCookie, yubaCookie].filter(Boolean).join('; '), 'User-Agent': DOUYU_USER_AGENT, 'Referer': 'https://yuba.douyu.com/mygroups' },
     validateStatus: status => status >= 200 && status < 400,
   })
 
   const authSetCookies = readSetCookieHeaders(authResponse.headers)
   const { refreshedCookie: finalYubaCookie, returnedKeys } = mergeCookieWithSetCookieHeaders(yubaCookie, authSetCookies, YUBA_RETURNED_COOKIE_KEYS)
   return { yubaCookie: finalYubaCookie, returnedKeys }
+}
+
+// ==================== Cookie 检查 ====================
+
+async function checkCookieValid() {
+  try {
+    const config = await loadConfig()
+    const cookie = buildCookieString(config.cookie)
+    if (!cookie) return { valid: false, reason: 'Cookie 未配置' }
+
+    const valid = await validateCookie(cookie)
+    return valid
+      ? { valid: true }
+      : { valid: false, reason: 'Cookie 已失效，请重新登录' }
+  } catch (error) {
+    return { valid: false, reason: `检查失败: ${error.message}` }
+  }
 }
 
 // ==================== HTTP 服务 ====================
@@ -263,84 +222,174 @@ const HTML_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>斗鱼扫码登录</title>
+<title>脚本工具</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 20px; }
-  .card { background: #fff; border-radius: 16px; padding: 24px; width: 100%; max-width: 380px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); text-align: center; }
-  h1 { font-size: 20px; color: #ff6a00; margin-bottom: 8px; }
-  .subtitle { font-size: 13px; color: #999; margin-bottom: 20px; }
-  .btn { display: inline-block; background: #ff6a00; color: #fff; border: none; padding: 12px 32px; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.2s; }
-  .btn:hover { background: #e55d00; }
-  .btn:disabled { background: #ccc; cursor: not-allowed; }
-  .qr-box { margin: 20px 0; }
-  .qr-box img { max-width: 260px; border: 1px solid #eee; border-radius: 8px; padding: 8px; }
-  .status { margin-top: 16px; font-size: 14px; min-height: 24px; }
-  .status.success { color: #22c55e; font-weight: 600; }
-  .status.error { color: #ef4444; }
-  .status.info { color: #3b82f6; }
-  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #ff6a00; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; background: #f0f2f5; min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px; }
+  .container { width: 100%; max-width: 440px; }
+  .header { text-align: center; margin-bottom: 16px; }
+  .header h1 { font-size: 20px; color: #1a1a1a; font-weight: 600; }
+  .header p { font-size: 13px; color: #999; margin-top: 4px; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .card-title { font-size: 14px; font-weight: 600; color: #333; margin-bottom: 14px; display: flex; align-items: center; gap: 6px; }
+  .card-title .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+  .dot-green { background: #22c55e; }
+  .dot-orange { background: #ff6a00; }
+  .dot-gray { background: #ccc; }
+  .btn { display: block; width: 100%; padding: 11px 0; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.15s; text-align: center; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: #ff6a00; color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #e55d00; }
+  .btn-success { background: #22c55e; color: #fff; }
+  .btn-success:hover:not(:disabled) { background: #16a34a; }
+  .btn-outline { background: transparent; color: #666; border: 1px solid #e0e0e0; margin-top: 8px; font-size: 13px; padding: 8px 0; }
+  .btn-outline:hover:not(:disabled) { background: #f5f5f5; border-color: #ccc; }
+  .status-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .status-bar.ok { background: #f0fdf4; color: #16a34a; }
+  .status-bar.err { background: #fef2f2; color: #dc2626; }
+  .status-bar.loading { background: #eff6ff; color: #2563eb; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .tip { font-size: 12px; color: #bbb; margin-top: 12px; }
-  .btn-run { display: none; background: #22c55e; color: #fff; border: none; padding: 12px 32px; border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 12px; width: 100%; }
-  .btn-run:hover { background: #16a34a; }
-  .btn-run:disabled { background: #ccc; cursor: not-allowed; }
-  .btn-run.show { display: inline-block; }
+  .qr-box { text-align: center; margin: 12px 0; }
+  .qr-box img { width: 200px; border-radius: 8px; }
+  .countdown { text-align: center; font-size: 12px; color: #ff6a00; margin-top: 6px; }
+  .log-box { background: #1a1a2e; color: #c9d1d9; border-radius: 8px; padding: 14px; font-size: 12px; font-family: "Cascadia Code", "Fira Code", "SF Mono", monospace; max-height: 300px; overflow-y: auto; line-height: 1.8; display: none; margin-top: 12px; }
+  .log-box .s { color: #7ee787; }
+  .log-box .e { color: #f85149; }
+  .log-box .w { color: #d29922; }
+  .sep { border: none; border-top: 1px dashed #30363d; margin: 4px 0; }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>🐟 斗鱼扫码登录</h1>
-  <p class="subtitle">生成二维码 → 用斗鱼 App 扫码 → 自动登录</p>
-  <button class="btn" id="btn" onclick="startLogin()">生成二维码</button>
-  <button class="btn-run" id="btnRun" onclick="runTasks()">🚀 执行任务（领取 + 保活）</button>
-  <div class="qr-box" id="qrBox"></div>
-  <div class="status" id="status"></div>
-  <p class="tip" id="tip"></p>
+<div class="container">
+  <div class="header">
+    <h1>脚本工具</h1>
+    <p>扫码登录 · 自动执行 · 邮件通知</p>
+  </div>
+
+  <!-- 状态卡片 -->
+  <div class="card" id="statusCard">
+    <div class="card-title"><span class="dot dot-gray" id="statusDot"></span>登录状态</div>
+    <div id="statusArea">
+      <div class="status-bar loading"><span class="spinner"></span>正在检查 Cookie...</div>
+    </div>
+  </div>
+
+  <!-- 登录卡片 -->
+  <div class="card hidden" id="loginCard">
+    <div class="card-title"><span class="dot dot-orange"></span>扫码登录</div>
+    <div class="qr-box" id="qrBox"></div>
+    <div class="countdown" id="countdown"></div>
+    <button class="btn btn-primary" id="btnQr" onclick="startLogin()">生成二维码</button>
+  </div>
+
+  <!-- 任务卡片 -->
+  <div class="card hidden" id="taskCard">
+    <div class="card-title"><span class="dot dot-green"></span>任务执行</div>
+    <button class="btn btn-success" id="btnRun" onclick="runTasks()">执行任务</button>
+    <button class="btn btn-outline" id="btnRelogin" onclick="showQrLogin()">重新登录</button>
+    <div class="log-box" id="logBox"></div>
+  </div>
 </div>
 <script>
-let polling = false
+let polling = false, countdownTimer = null
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
+
+function formatLog(text) {
+  return text.split('\\n').map(line => {
+    line = esc(line)
+    if (line.includes('[SUCCESS]') || line.includes('成功')) return '<span class="s">' + line + '</span>'
+    if (line.includes('[ERROR]') || line.includes('失败') || line.includes('异常')) return '<span class="e">' + line + '</span>'
+    if (line.includes('[WARN]')) return '<span class="w">' + line + '</span>'
+    if (line.includes('====')) return '<hr class="sep">'
+    return line
+  }).join('<br>')
+}
+
+function showStatus(type, html) {
+  const area = document.getElementById('statusArea')
+  const dot = document.getElementById('statusDot')
+  dot.className = 'dot ' + (type === 'ok' ? 'dot-green' : type === 'err' ? 'dot-orange' : 'dot-gray')
+  area.innerHTML = '<div class="status-bar ' + (type === 'ok' ? 'ok' : type === 'err' ? 'err' : 'loading') + '">' + html + '</div>'
+}
+
+window.onload = async function() {
+  const loginCard = document.getElementById('loginCard')
+  const taskCard = document.getElementById('taskCard')
+
+  try {
+    const res = await fetch('/api/check-cookie')
+    const data = await res.json()
+    if (data.valid) {
+      showStatus('ok', '✅ Cookie 有效，可以直接执行任务')
+      taskCard.classList.remove('hidden')
+    } else {
+      showStatus('err', '❌ ' + esc(data.reason))
+      loginCard.classList.remove('hidden')
+    }
+  } catch (e) {
+    showStatus('err', '检查失败: ' + e.message)
+    loginCard.classList.remove('hidden')
+  }
+}
+
+function showQrLogin() {
+  document.getElementById('loginCard').classList.remove('hidden')
+  document.getElementById('taskCard').classList.add('hidden')
+  document.getElementById('qrBox').innerHTML = ''
+  document.getElementById('countdown').textContent = ''
+  document.getElementById('btnQr').textContent = '生成二维码'
+  document.getElementById('btnQr').disabled = false
+  document.getElementById('logBox').style.display = 'none'
+  showStatus('err', '需要重新登录')
+}
+
+function startCountdown(seconds, el) {
+  if (countdownTimer) clearInterval(countdownTimer)
+  let r = seconds
+  el.textContent = '剩余 ' + r + ' 秒'
+  countdownTimer = setInterval(() => {
+    r--
+    el.textContent = r > 0 ? '剩余 ' + r + ' 秒' : '已过期'
+    if (r <= 0) clearInterval(countdownTimer)
+  }, 1000)
+}
+
 async function startLogin() {
-  const btn = document.getElementById('btn')
+  const btn = document.getElementById('btnQr')
   const qrBox = document.getElementById('qrBox')
-  const status = document.getElementById('status')
-  const tip = document.getElementById('tip')
-  const btnRun = document.getElementById('btnRun')
+  const countdown = document.getElementById('countdown')
   btn.disabled = true
   btn.textContent = '生成中...'
   qrBox.innerHTML = ''
-  status.className = 'status'
-  status.textContent = ''
-  tip.textContent = ''
-  btnRun.classList.remove('show')
+  countdown.textContent = ''
 
   try {
     const res = await fetch('/api/qr/generate')
     const data = await res.json()
-    if (!data.success) { throw new Error(data.error) }
-    qrBox.innerHTML = '<img src="' + data.qrDataUrl + '" alt="扫码登录" />'
-    status.className = 'status info'
-    status.textContent = '请用斗鱼 App 扫描上方二维码'
-    tip.textContent = '二维码有效期 5 分钟，过期后可重新生成'
+    if (!data.success) throw new Error(data.error)
+    qrBox.innerHTML = '<img src="' + data.qrDataUrl + '" />'
     btn.textContent = '重新生成'
     btn.disabled = false
+    startCountdown(data.expiresIn, countdown)
     startPolling(data.sessionId)
   } catch (e) {
-    status.className = 'status error'
-    status.textContent = '生成失败: ' + e.message
     btn.textContent = '重新生成'
     btn.disabled = false
+    showStatus('err', '生成失败: ' + e.message)
   }
 }
 
 async function startPolling(sessionId) {
   if (polling) return
   polling = true
-  const status = document.getElementById('status')
-  const tip = document.getElementById('tip')
-  const btn = document.getElementById('btn')
+  const btn = document.getElementById('btnQr')
   const qrBox = document.getElementById('qrBox')
-  const btnRun = document.getElementById('btnRun')
+  const countdown = document.getElementById('countdown')
+  const loginCard = document.getElementById('loginCard')
+  const taskCard = document.getElementById('taskCard')
 
   for (let i = 0; i < 150; i++) {
     await new Promise(r => setTimeout(r, 2000))
@@ -348,98 +397,79 @@ async function startPolling(sessionId) {
       const res = await fetch('/api/qr/poll?sessionId=' + sessionId)
       const data = await res.json()
       if (data.status === 'scanned') {
-        status.className = 'status info'
-        status.innerHTML = '<span class="spinner"></span>已扫码，等待确认...'
+        showStatus('loading', '<span class="spinner"></span>已扫码，等待确认...')
       } else if (data.status === 'confirmed') {
-        status.className = 'status info'
-        status.innerHTML = '<span class="spinner"></span>扫码成功，正在获取 Cookie...'
+        showStatus('loading', '<span class="spinner"></span>正在获取 Cookie...')
       } else if (data.status === 'done') {
-        status.className = 'status success'
-        status.innerHTML = '✅ 登录成功！LTP0 和 Cookie 已保存'
-        tip.textContent = '点击下方按钮立即执行任务，或等待定时任务自动执行'
-        qrBox.innerHTML = ''
-        btn.style.display = 'none'
-        btnRun.classList.add('show')
+        if (countdownTimer) clearInterval(countdownTimer)
+        showStatus('ok', '✅ 登录成功，Cookie 已保存')
+        loginCard.classList.add('hidden')
+        taskCard.classList.remove('hidden')
+        document.getElementById('logBox').style.display = 'none'
         polling = false
         return
       } else if (data.status === 'expired') {
-        status.className = 'status error'
-        status.textContent = '二维码已过期，请重新生成'
+        if (countdownTimer) clearInterval(countdownTimer)
+        countdown.textContent = ''
         btn.textContent = '重新生成'
         btn.disabled = false
+        showStatus('err', '二维码已过期')
         polling = false
         return
       } else if (data.status === 'failed') {
-        status.className = 'status error'
-        status.textContent = '登录失败: ' + (data.error || '未知错误')
+        if (countdownTimer) clearInterval(countdownTimer)
+        countdown.textContent = ''
         btn.textContent = '重新生成'
         btn.disabled = false
+        showStatus('err', '登录失败: ' + esc(data.error || ''))
         polling = false
         return
       }
-    } catch (e) {
-      // 继续重试
-    }
+    } catch (e) {}
   }
   polling = false
 }
 
 async function runTasks() {
-  const btnRun = document.getElementById('btnRun')
-  const status = document.getElementById('status')
-  const tip = document.getElementById('tip')
-  btnRun.disabled = true
-  btnRun.innerHTML = '<span class="spinner"></span>执行中...'
+  const btn = document.getElementById('btnRun')
+  const logBox = document.getElementById('logBox')
+  btn.disabled = true
+  btn.innerHTML = '<span class="spinner"></span>执行中...'
+  logBox.style.display = 'block'
+  logBox.innerHTML = '<span class="s">任务启动中...</span><br>'
 
   try {
     const res = await fetch('/api/run-tasks')
     const data = await res.json()
-    if (!data.success) {
-      btnRun.textContent = data.message
-      btnRun.disabled = false
-      return
-    }
-    status.className = 'status info'
-    status.innerHTML = '<span class="spinner"></span>任务执行中，请等待...'
-    tip.textContent = '完成后会自动发送邮件通知，也可以查看邮箱'
-
-    // 轮询任务状态
+    if (!data.success) { btn.textContent = data.message; btn.disabled = false; return }
     pollTaskStatus()
   } catch (e) {
-    btnRun.textContent = '执行失败，请重试'
-    btnRun.disabled = false
+    btn.textContent = '执行失败，请重试'
+    btn.disabled = false
   }
 }
 
 async function pollTaskStatus() {
-  const btnRun = document.getElementById('btnRun')
-  const status = document.getElementById('status')
-  const tip = document.getElementById('tip')
+  const btn = document.getElementById('btnRun')
+  const logBox = document.getElementById('logBox')
 
   for (let i = 0; i < 120; i++) {
     await new Promise(r => setTimeout(r, 2000))
     try {
       const res = await fetch('/api/task-status')
       const data = await res.json()
+      if (data.output) { logBox.innerHTML = formatLog(data.output); logBox.scrollTop = logBox.scrollHeight }
       if (!data.running && data.endTime) {
-        if (data.error) {
-          status.className = 'status error'
-          status.innerHTML = '⚠️ 任务执行完成（可能有部分失败）'
-        } else {
-          status.className = 'status success'
-          status.innerHTML = '✅ 任务执行完成！'
-        }
-        tip.textContent = '请查看邮箱获取详细执行结果'
-        btnRun.textContent = '执行完成'
+        if (data.output) { logBox.innerHTML = formatLog(data.output); logBox.scrollTop = logBox.scrollHeight }
+        showStatus(data.error ? 'err' : 'ok', data.error ? '⚠️ 执行完成（部分失败）' : '✅ 执行完成')
+        btn.textContent = '执行完成'
+        btn.disabled = false
         return
       }
-    } catch (e) {
-      // 继续重试
-    }
+    } catch (e) {}
   }
-  status.className = 'status info'
-  status.textContent = '任务仍在执行中，请查看邮箱获取结果'
-  btnRun.textContent = '任务执行中...'
+  btn.textContent = '执行中...'
+  showStatus('loading', '任务仍在执行，可查看邮箱获取结果')
 }
 </script>
 </body>
@@ -568,6 +598,13 @@ const server = http.createServer(async (req, res) => {
       error: currentSession.error,
       expiresIn: Math.max(0, Math.floor((300000 - (Date.now() - currentSession.createdAt)) / 1000)),
     })
+    return
+  }
+
+  // 检查 Cookie 有效性
+  if (url.pathname === '/api/check-cookie') {
+    const result = await checkCookieValid()
+    sendJson(res, result)
     return
   }
 
