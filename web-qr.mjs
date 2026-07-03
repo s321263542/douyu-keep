@@ -12,11 +12,15 @@
  */
 
 import http from 'node:http'
+import { execFile } from 'node:child_process'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import axios from 'axios'
 import QRCode from 'qrcode'
 import * as logger from './logger.mjs'
 import config from './config.mjs'
-import { sendEmail } from './email.mjs'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const PORT = 3456
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/15.0.1901.188'
@@ -106,6 +110,25 @@ function updateConfigFields(updates) {
     if (regex.test(content)) content = content.replace(regex, `$1${value}$3`)
   }
   writeFileSync(configPath, content, 'utf-8')
+}
+
+// ==================== 任务执行状态 ====================
+
+let taskStatus = { running: false, startTime: null, endTime: null, output: '', error: null }
+
+function runTasks() {
+  if (taskStatus.running) return false
+  taskStatus = { running: true, startTime: Date.now(), endTime: null, output: '', error: null }
+
+  const runMjsPath = join(__dirname, 'run.mjs')
+  execFile(process.execPath, [runMjsPath], { cwd: __dirname, timeout: 120000 }, (error, stdout, stderr) => {
+    taskStatus.running = false
+    taskStatus.endTime = Date.now()
+    taskStatus.output = stdout || ''
+    taskStatus.error = error ? (stderr || error.message) : null
+    logger.info(`[Web 任务] 执行完成${error ? '（有错误）' : '（成功）'}`)
+  })
+  return true
 }
 
 // ==================== 扫码登录逻辑 ====================
@@ -259,6 +282,10 @@ const HTML_PAGE = `<!DOCTYPE html>
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #ff6a00; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .tip { font-size: 12px; color: #bbb; margin-top: 12px; }
+  .btn-run { display: none; background: #22c55e; color: #fff; border: none; padding: 12px 32px; border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 12px; width: 100%; }
+  .btn-run:hover { background: #16a34a; }
+  .btn-run:disabled { background: #ccc; cursor: not-allowed; }
+  .btn-run.show { display: inline-block; }
 </style>
 </head>
 <body>
@@ -266,6 +293,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   <h1>🐟 斗鱼扫码登录</h1>
   <p class="subtitle">生成二维码 → 用斗鱼 App 扫码 → 自动登录</p>
   <button class="btn" id="btn" onclick="startLogin()">生成二维码</button>
+  <button class="btn-run" id="btnRun" onclick="runTasks()">🚀 执行任务（领取 + 保活）</button>
   <div class="qr-box" id="qrBox"></div>
   <div class="status" id="status"></div>
   <p class="tip" id="tip"></p>
@@ -277,12 +305,14 @@ async function startLogin() {
   const qrBox = document.getElementById('qrBox')
   const status = document.getElementById('status')
   const tip = document.getElementById('tip')
+  const btnRun = document.getElementById('btnRun')
   btn.disabled = true
   btn.textContent = '生成中...'
   qrBox.innerHTML = ''
   status.className = 'status'
   status.textContent = ''
   tip.textContent = ''
+  btnRun.classList.remove('show')
 
   try {
     const res = await fetch('/api/qr/generate')
@@ -310,6 +340,7 @@ async function startPolling(sessionId) {
   const tip = document.getElementById('tip')
   const btn = document.getElementById('btn')
   const qrBox = document.getElementById('qrBox')
+  const btnRun = document.getElementById('btnRun')
 
   for (let i = 0; i < 150; i++) {
     await new Promise(r => setTimeout(r, 2000))
@@ -325,10 +356,10 @@ async function startPolling(sessionId) {
       } else if (data.status === 'done') {
         status.className = 'status success'
         status.innerHTML = '✅ 登录成功！LTP0 和 Cookie 已保存'
-        tip.textContent = '可以关闭此页面，定时任务将自动使用新 Cookie'
+        tip.textContent = '点击下方按钮立即执行任务，或等待定时任务自动执行'
         qrBox.innerHTML = ''
-        btn.textContent = '完成'
-        btn.disabled = true
+        btn.style.display = 'none'
+        btnRun.classList.add('show')
         polling = false
         return
       } else if (data.status === 'expired') {
@@ -351,6 +382,64 @@ async function startPolling(sessionId) {
     }
   }
   polling = false
+}
+
+async function runTasks() {
+  const btnRun = document.getElementById('btnRun')
+  const status = document.getElementById('status')
+  const tip = document.getElementById('tip')
+  btnRun.disabled = true
+  btnRun.innerHTML = '<span class="spinner"></span>执行中...'
+
+  try {
+    const res = await fetch('/api/run-tasks')
+    const data = await res.json()
+    if (!data.success) {
+      btnRun.textContent = data.message
+      btnRun.disabled = false
+      return
+    }
+    status.className = 'status info'
+    status.innerHTML = '<span class="spinner"></span>任务执行中，请等待...'
+    tip.textContent = '完成后会自动发送邮件通知，也可以查看邮箱'
+
+    // 轮询任务状态
+    pollTaskStatus()
+  } catch (e) {
+    btnRun.textContent = '执行失败，请重试'
+    btnRun.disabled = false
+  }
+}
+
+async function pollTaskStatus() {
+  const btnRun = document.getElementById('btnRun')
+  const status = document.getElementById('status')
+  const tip = document.getElementById('tip')
+
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 2000))
+    try {
+      const res = await fetch('/api/task-status')
+      const data = await res.json()
+      if (!data.running && data.endTime) {
+        if (data.error) {
+          status.className = 'status error'
+          status.innerHTML = '⚠️ 任务执行完成（可能有部分失败）'
+        } else {
+          status.className = 'status success'
+          status.innerHTML = '✅ 任务执行完成！'
+        }
+        tip.textContent = '请查看邮箱获取详细执行结果'
+        btnRun.textContent = '执行完成'
+        return
+      }
+    } catch (e) {
+      // 继续重试
+    }
+  }
+  status.className = 'status info'
+  status.textContent = '任务仍在执行中，请查看邮箱获取结果'
+  btnRun.textContent = '任务执行中...'
 }
 </script>
 </body>
@@ -479,6 +568,19 @@ const server = http.createServer(async (req, res) => {
       error: currentSession.error,
       expiresIn: Math.max(0, Math.floor((300000 - (Date.now() - currentSession.createdAt)) / 1000)),
     })
+    return
+  }
+
+  // 执行任务
+  if (url.pathname === '/api/run-tasks') {
+    const started = runTasks()
+    sendJson(res, { success: started, message: started ? '任务已启动，完成后邮件通知' : '任务正在执行中，请勿重复触发' })
+    return
+  }
+
+  // 查询任务执行状态
+  if (url.pathname === '/api/task-status') {
+    sendJson(res, taskStatus)
     return
   }
 
