@@ -1,4 +1,4 @@
-# 斗鱼荧光棒工具
+# 脚本工具
 
 > 一个基于 Node.js 的斗鱼荧光棒自动领取和粉丝牌保活工具，支持 Cookie 自动刷新和扫码登录
 
@@ -12,6 +12,7 @@
 - Cookie 自动刷新（LTP0 + safeAuth，几个月免手动）
 - 扫码登录（邮件/网页两种方式获取新 Cookie）
 - 邮件通知（运行结果自动发送到邮箱）
+- HTTP 请求统一超时 + 自动重试机制
 
 ## 致谢与借鉴
 
@@ -34,9 +35,10 @@ node run.mjs
     │
     ▼
 0. Cookie 管理
-    ├── 有 LTP0？→ 用 safeAuth 自动刷新 Cookie
-    ├── 刷新失败？→ 发送扫码登录二维码邮件
-    └── 扫码登录？→ 自动获取新 Cookie + LTP0
+    ├── 验证当前 Cookie 是否有效
+    ├── 无效 → 尝试 LTP0 自动刷新
+    ├── 刷新失败 → 触发扫码登录
+    └── 全部失败 → 退出任务
     │
     ▼
 1. 荧光棒领取 (collect-gift.mjs)
@@ -57,6 +59,13 @@ node run.mjs
 
 ## 文件说明
 
+### 公共模块
+
+| 文件 | 说明 |
+|------|------|
+| `utils.mjs` | 工具函数（Cookie 解析、config 动态加载、设备 ID 生成） |
+| `api.mjs` | 斗鱼 API 封装（getFansList、getGiftNumber、sendGift 等，带超时重试） |
+
 ### 核心模块
 
 | 文件 | 说明 |
@@ -64,7 +73,6 @@ node run.mjs
 | `run.mjs` | 主入口，串联 Cookie 刷新→领取→保活→邮件 |
 | `collect-gift.mjs` | 荧光棒领取（WebSocket 弹幕协议） |
 | `keepalive.mjs` | 粉丝牌保活（赠送荧光棒） |
-| `config.mjs` | 配置文件（Cookie、房间、邮件等） |
 | `email.mjs` | 邮件通知模块 |
 | `logger.mjs` | 日志模块（按日期保存到 logs/） |
 
@@ -77,6 +85,13 @@ node run.mjs
 | `qr-login-cmd.mjs` | 手动触发扫码登录的命令行入口 |
 | `web-qr.mjs` | 扫码登录网页服务（手机浏览器访问即可扫码） |
 
+### 配置文件
+
+| 文件 | 说明 |
+|------|------|
+| `config.mjs` | 配置模板（空值，提交到仓库） |
+| `config.local.mjs` | 本地真实配置（不提交，.gitignore 排除） |
+
 ### 其他
 
 | 文件/文件夹 | 说明 |
@@ -88,7 +103,13 @@ node run.mjs
 
 ## 配置说明
 
-### config.mjs 结构
+### 配置文件结构
+
+项目使用两个配置文件：
+- `config.mjs` — 空模板，提交到仓库，供参考
+- `config.local.mjs` — 真实配置，本地使用，不提交
+
+程序优先读取 `config.local.mjs`，不存在则读取 `config.mjs`。
 
 ```javascript
 export default {
@@ -163,13 +184,14 @@ npm run web-qr
 npm run qr-login
 ```
 
-扫码成功后 LTP0 和 Cookie 自动保存到 config.mjs，无需手动填写。
+扫码成功后 LTP0 和 Cookie 自动保存到 config.local.mjs，无需手动填写。
 
 **方式二：手动填写 Cookie**
 
-1. 浏览器登录斗鱼 → F12 → Network → 任意请求 → Cookie
-2. 复制所需字段填入 config.mjs
-3. 可选：从 `passport.douyu.com` 的 Cookie 中复制 LTP0，启用自动刷新
+1. 复制 `config.mjs` 为 `config.local.mjs`
+2. 浏览器登录斗鱼 → F12 → Network → 任意请求 → Cookie
+3. 复制所需字段填入 `config.local.mjs`
+4. 可选：从 `passport.douyu.com` 的 Cookie 中复制 LTP0，启用自动刷新
 
 ### 运行命令
 
@@ -235,7 +257,7 @@ LTP0 也过期（几个月后）
 
 1. 开启邮箱的 SMTP 服务
 2. 获取 SMTP 授权码（不是邮箱密码）
-3. 在 config.mjs 中配置
+3. 在 config.local.mjs 中配置
 
 **QQ 邮箱：** 设置 → 账户 → POP3/SMTP 服务 → 开启 → 生成授权码
 
@@ -253,9 +275,10 @@ tail -f logs/$(date +%Y-%m-%d).log
 ## 注意事项
 
 1. Cookie 包含登录凭证，请妥善保管，不要泄露
-2. 建议每天运行一次，避免重复领取
-3. 遇到问题先查看 logs/ 日志
-4. LTP0 有效期数月，过期后需重新扫码
+2. `config.local.mjs` 包含敏感信息，不要提交到仓库
+3. 建议每天运行一次，避免重复领取
+4. 遇到问题先查看 logs/ 日志
+5. LTP0 有效期数月，过期后需重新扫码
 
 ## 许可证
 
